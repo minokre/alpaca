@@ -130,6 +130,22 @@ func TestPacFromFilesystem(t *testing.T) {
 	assert.True(t, pf.isConnected())
 }
 
+func TestFileURLPathOnWindows(t *testing.T) {
+	tests := map[string]string{
+		"file:///C:/Users/alice/proxy.pac": `C:\Users\alice\proxy.pac`,
+		"file:///D:/Proxy/proxy.pac":      `D:\Proxy\proxy.pac`,
+		"file://server/share/proxy.pac":   `\\server\share\proxy.pac`,
+		"file://C:/Proxy/proxy.pac":       `C:\Proxy\proxy.pac`,
+	}
+	for uri, expected := range tests {
+		t.Run(uri, func(t *testing.T) {
+			actual, err := fileURLPath(uri, "windows")
+			require.NoError(t, err)
+			assert.Equal(t, expected, actual)
+		})
+	}
+}
+
 func TestDecodeDataURL(t *testing.T) {
 	tests := []struct {
 		name     string

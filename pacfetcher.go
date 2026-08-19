@@ -22,6 +22,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -57,11 +59,6 @@ func newPACFetcher(pacurl string) *pacFetcher {
 		log.Print("Warning: When using a local PAC file, the online/offline status can't ",
 			"be determined by the fact that the PAC file is downloaded. Make sure you ",
 			"check for proxy connectivity in your PAC file!")
-		if runtime.GOOS == "windows" {
-			client.Transport = http.NewFileTransport(http.Dir("C:"))
-		} else {
-			client.Transport = http.NewFileTransport(http.Dir("/"))
-		}
 	} else {
 		// The DefaultClient in net/http uses the proxy specified in the http(s)_proxy
 		// environment variable, which could be pointing at this instance of alpaca. When
@@ -74,6 +71,56 @@ func newPACFetcher(pacurl string) *pacFetcher {
 		monitor:   newNetMonitor(),
 		client:    client,
 	}
+}
+
+func fileURLPath(uri, goos string) (string, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("error parsing local PAC URL: %w", err)
+	}
+	if parsed.Scheme != "file" {
+		return "", fmt.Errorf("local PAC URL must use the file scheme")
+	}
+
+	if goos == "windows" {
+		path := strings.ReplaceAll(parsed.Path, "/", `\`)
+		if len(parsed.Host) == 2 && parsed.Host[1] == ':' {
+			return parsed.Host + path, nil
+		}
+		if parsed.Host != "" && !strings.EqualFold(parsed.Host, "localhost") {
+			return `\\` + parsed.Host + path, nil
+		}
+		if len(path) >= 3 && path[0] == '\\' && path[2] == ':' {
+			path = path[1:]
+		}
+		return path, nil
+	}
+
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		return "", fmt.Errorf("local PAC URL with remote host %q is unsupported", parsed.Host)
+	}
+	return filepath.FromSlash(parsed.Path), nil
+}
+
+func readLocalPAC(uri string) ([]byte, error) {
+	path, err := fileURLPath(uri, runtime.GOOS)
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open local PAC file: %w", err)
+	}
+	defer file.Close() //nolint:errcheck
+
+	content, err := io.ReadAll(io.LimitReader(file, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read local PAC file: %w", err)
+	}
+	if len(content) > maxResponseBytes {
+		return nil, fmt.Errorf("PAC JS is too big (limit is %d bytes)", maxResponseBytes)
+	}
+	return content, nil
 }
 
 func requireOK(resp *http.Response, err error) (*http.Response, error) {
@@ -150,6 +197,15 @@ func (pf *pacFetcher) download() []byte {
 	}
 
 	log.Printf("Attempting to download PAC from %s", pacurl)
+	if strings.HasPrefix(pacurl, "file:") {
+		pac, err := readLocalPAC(pacurl)
+		if err != nil {
+			log.Printf("Error reading local PAC file: %v", err)
+			return nil
+		}
+		pf.connected = true
+		return pac
+	}
 
 	pac, err := decodeDataURL(pacurl)
 	if err != nil {

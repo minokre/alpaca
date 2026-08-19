@@ -61,6 +61,7 @@ If the proxy server requires valid authentication credentials, you can provide t
 
 - HTTP Basic authentication, if `BASIC_CREDENTIALS=login:password` is set in
   the environment;
+- HTTP Basic authentication from the system keyring, if `-basic-user` is set;
 - Kerberos / Negotiate, **automatically on macOS** when a ticket from Apple SSO
   / Ticket Viewer / `kinit` is available — no flag required (pass
   `--no-kerberos` to opt out). Tickets that arrive *after* alpaca starts are
@@ -216,6 +217,25 @@ $ alpaca -d MYDOMAIN -u me
 Password (for MYDOMAIN\me):
 ```
 
+### HTTP Basic credentials in the system keyring
+
+To avoid storing a Basic proxy password in plaintext, save it in the system
+keyring once. On Windows this uses Windows Credential Manager:
+
+```powershell
+.\alpaca.exe -basic-user me@example.com -store-basic
+```
+
+Alpaca prompts for the password without echoing it. Start it later with the
+same username and no password on the command line:
+
+```powershell
+.\alpaca.exe -basic-user me@example.com -C file:///C:/path/to/proxy.pac
+```
+
+`BASIC_USERNAME` can be used instead of repeating `-basic-user`. If
+`BASIC_CREDENTIALS` is set, it takes precedence for backwards compatibility.
+
 ### Non-interactive launch
 
 If you want to use Alpaca without any interactive password prompt, you can store
@@ -269,6 +289,8 @@ can set this manually using the `-C` flag.
 | `-C` | (none) | URL of proxy auto-config (PAC) file |
 | `-d` | (none) | Domain of the proxy account (for NTLM auth) |
 | `-u` | current user | Username for proxy auth (NTLM) |
+| `-basic-user` | `BASIC_USERNAME` | Username for Basic proxy auth; the password is read from the system keyring |
+| `-store-basic` | `false` | Prompt for and store the Basic proxy password in the system keyring, then exit |
 | `-H` | `false` | Print hashed NTLM credentials and exit |
 | `-no-kerberos` | `false` | Disable Kerberos / Negotiate auto-detection (macOS only) |
 | `-enable-socks` | `false` | Allow SOCKS5 proxies from PAC files. SOCKS5 has its own auth model and bypasses alpaca's HTTP authentication chain (and therefore the proxy-auth allowlist). |
@@ -281,6 +303,7 @@ can set this manually using the `-C` flag.
 |----------|-------------|
 | `NTLM_CREDENTIALS`            | `username@DOMAIN:hash` (run `alpaca -H` to generate) |
 | `BASIC_CREDENTIALS`           | `login:password` for HTTP Basic proxy auth |
+| `BASIC_USERNAME`              | Username used to retrieve the Basic proxy password from the system keyring |
 | `ALPACA_PROXY_AUTH_ALLOWLIST` | Comma-separated DNS suffixes that may receive proxy credentials. Applies uniformly to Basic, NTLM, and Negotiate. Default is permissive (any host); set to `*` for the explicit permissive form. See "Restricting where Alpaca sends credentials" above. |
 | `NTLM_USERNAME` / `NTLM_DOMAIN` | Used by the keyring credential source (Linux/GNOME, Windows) |
 

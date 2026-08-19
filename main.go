@@ -60,6 +60,10 @@ func main() {
 	pacurl := flag.String("C", "", "url of proxy auto-config (pac) file")
 	domain := flag.String("d", "", "domain of the proxy account (for NTLM auth)")
 	username := flag.String("u", whoAmI(), "username for proxy auth (NTLM)")
+	basicUsername := flag.String("basic-user", os.Getenv("BASIC_USERNAME"),
+		"username for Basic proxy auth (password is read from the system keyring)")
+	storeBasic := flag.Bool("store-basic", false,
+		"prompt for and store the Basic proxy password in the system keyring, then exit")
 	printHash := flag.Bool("H", false, "print hashed NTLM credentials for non-interactive use")
 	noKerberos := flag.Bool("no-kerberos", false,
 		"disable Kerberos/Negotiate auto-detection (macOS only)")
@@ -82,6 +86,26 @@ func main() {
 		os.Exit(0)
 	}
 
+	secretStore := systemBasicSecretStore{}
+	if *storeBasic {
+		if *basicUsername == "" {
+			fmt.Fprintln(os.Stderr, "Please specify a Basic proxy username using -basic-user")
+			os.Exit(2)
+		}
+		terminal := fromTerminal()
+		_, _ = fmt.Fprintf(terminal.stdout, "Basic proxy password (for %s): ", *basicUsername)
+		password, err := terminal.readPassword()
+		fmt.Println()
+		if err != nil {
+			log.Fatalf("Cannot read Basic proxy password: %v", err)
+		}
+		if err := storeBasicCredentials(*basicUsername, string(password), secretStore); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Stored Basic proxy credentials for %s in the system keyring.\n", *basicUsername)
+		return
+	}
+
 	var basicAuth *basicAuthenticator
 	var a *authenticator
 
@@ -90,6 +114,15 @@ func main() {
 	if value := os.Getenv("BASIC_CREDENTIALS"); value != "" {
 		basicAuth = newBasicAuthenticator(value)
 		log.Println("Basic proxy authentication configured from BASIC_CREDENTIALS")
+	} else if *basicUsername != "" {
+		var err error
+		basicAuth, err = basicAuthenticatorFromKeyring(*basicUsername, secretStore)
+		if err != nil {
+			log.Printf("Basic proxy credentials not available from the system keyring: %v", err)
+		} else {
+			log.Printf("Basic proxy authentication configured from the system keyring for %s",
+				*basicUsername)
+		}
 	}
 
 	// NTLM credential sources
