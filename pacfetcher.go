@@ -43,10 +43,13 @@ var delayAfterFailedDownload = 2 * time.Second
 
 // How long to wait before looking for the PAC file again after giving up on it, and the ceiling
 // that this delay backs off to. Until a PAC script has been loaded, every request is sent
-// DIRECT, so it's worth looking again reasonably eagerly at first.
+// DIRECT, so it's worth looking again eagerly: a common reason to be without one is that alpaca
+// started before the machine's DNS or VPN connection was ready, and that resolves itself within
+// a minute or two. The ceiling stays low for the same reason, since a failed lookup is cheap
+// while sending a whole session's traffic DIRECT is not.
 var (
 	initialRetryDelay = 5 * time.Second
-	maxRetryDelay     = 5 * time.Minute
+	maxRetryDelay     = 1 * time.Minute
 )
 
 type pacFetcher struct {
