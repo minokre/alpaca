@@ -4,3 +4,16 @@
 __debug_bin*
 .idea
 .DS_Store
+
+# Test binaries built with "go test -c", e.g. to get them past application
+# whitelisting that won't run executables from the temp directory.
+*.test
+*.test.exe
+
+# Local build output and patches.
+/dist/
+
+# Go coverage and profiling output.
+*.out
+*.prof
+coverage.txt
