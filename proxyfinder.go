@@ -40,6 +40,7 @@ type ProxyFinder struct {
 	fetcher     *pacFetcher
 	wrapper     *PACWrapper
 	blocked     *blocklist
+	runnerReady bool
 	enableSocks bool
 	sync.Mutex
 }
@@ -85,6 +86,7 @@ func (pf *ProxyFinder) checkForUpdates() {
 		log.Printf("Error running PAC JS: %q", err)
 	} else {
 		pf.wrapper.Wrap(pacjs)
+		pf.runnerReady = true
 	}
 }
 
@@ -96,6 +98,11 @@ func (pf *ProxyFinder) findProxyForRequest(req *http.Request) (*url.URL, error) 
 	}
 	if !pf.fetcher.isConnected() {
 		log.Printf(`[%d] %s %s via "DIRECT" (not connected to PAC server)`,
+			id, req.Method, req.URL)
+		return nil, nil
+	}
+	if !pf.runnerReady {
+		log.Printf(`[%d] %s %s via "DIRECT" (no valid PAC JS loaded yet)`,
 			id, req.Method, req.URL)
 		return nil, nil
 	}
