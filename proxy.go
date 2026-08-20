@@ -381,12 +381,25 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain) (net
 		log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
 		return nil, err
 	}
+	// Preemptive Basic: when this proxy already challenged for and
+	// accepted Basic in this session, send the credentials up front
+	// and save the 407 round-trip plus re-dial per tunnel. If the
+	// proxy rejects them anyway, the normal challenge-driven flow
+	// below still runs (the retry helper clears the header first).
+	preemptive := false
+	if header, ok := auth.preemptiveBasic(proxyURL.Hostname()); ok {
+		req.Header.Set("Proxy-Authorization", header)
+		preemptive = true
+	}
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		log.Printf("[%d] Error reading CONNECT response: %v", id, err)
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusProxyAuthRequired && auth != nil {
+		if preemptive {
+			auth.forgetBasic(proxyURL.Hostname())
+		}
 		log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
 		schemes := parseProxyAuthenticateSchemes(resp.Header)
 		_ = resp.Body.Close()
@@ -451,6 +464,9 @@ func retryConnectWithAuth(req *http.Request, proxyURL *url.URL, auth *authChain,
 			return nil, err
 		}
 		if resp.StatusCode != http.StatusProxyAuthRequired {
+			if _, ok := method.(*basicAuthenticator); ok {
+				auth.recordBasicSuccess(proxyURL.Hostname())
+			}
 			return resp, nil
 		}
 		if i < len(candidates)-1 {
@@ -476,6 +492,18 @@ func (ph ProxyHandler) proxyRequest(w http.ResponseWriter, req *http.Request, au
 	}
 	rd := bytes.NewReader(buf.Bytes())
 	req.Body = io.NopCloser(rd)
+	// Preemptive Basic, mirroring connectViaProxy. Only when the
+	// request actually goes via a proxy: on a DIRECT request the
+	// header would hand the proxy credentials to the origin server.
+	preemptive := false
+	preemptiveHost := ""
+	if proxyURL, _ := getProxyFromContext(req); proxyURL != nil {
+		if header, ok := auth.preemptiveBasic(proxyURL.Hostname()); ok {
+			req.Header.Set("Proxy-Authorization", header)
+			preemptive = true
+			preemptiveHost = proxyURL.Hostname()
+		}
+	}
 	resp, err := ph.transport.RoundTrip(req)
 	if err != nil {
 		log.Printf("[%d] Error forwarding request: %v", id, err)
@@ -493,6 +521,9 @@ func (ph ProxyHandler) proxyRequest(w http.ResponseWriter, req *http.Request, au
 		return
 	}
 	if resp.StatusCode == http.StatusProxyAuthRequired && auth != nil {
+		if preemptive {
+			auth.forgetBasic(preemptiveHost)
+		}
 		schemes := parseProxyAuthenticateSchemes(resp.Header)
 		_ = resp.Body.Close()
 		log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
@@ -567,6 +598,9 @@ func retryProxyRequestWithAuth(req *http.Request, rt *http.Transport, auth *auth
 			return nil, err
 		}
 		if resp.StatusCode != http.StatusProxyAuthRequired {
+			if _, ok := method.(*basicAuthenticator); ok {
+				auth.recordBasicSuccess(proxyHost)
+			}
 			return resp, nil
 		}
 		if i < len(candidates)-1 {

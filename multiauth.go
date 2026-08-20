@@ -18,6 +18,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 )
 
 // authChain is the picker that proxy.go drives. It owns the ordered list
@@ -39,6 +40,18 @@ import (
 type authChain struct {
 	methods       []proxyAuthenticator
 	hostAllowlist []string // nil = permit any host (the default)
+
+	// basicKnown records proxy hosts that have, during this session,
+	// challenged with Basic and then accepted our Basic credentials.
+	// For these hosts the credentials are sent preemptively on
+	// subsequent requests, saving a 407 round-trip (and, on the
+	// CONNECT path, a re-dial) per connection. RFC 7617 §2.2 endorses
+	// this for Basic; the connection-bound schemes (NTLM, Negotiate)
+	// are challenge-driven by design and are never sent preemptively.
+	//
+	// Guarded by mu: the chain is shared across request goroutines.
+	mu         sync.Mutex
+	basicKnown map[string]bool
 }
 
 // newAuthChain builds an authChain from the given methods, skipping nil
@@ -146,6 +159,80 @@ func (c *authChain) pick(schemes []string, proxyHost string) []proxyAuthenticato
 			schemes)
 	}
 	return matched
+}
+
+// normalizeProxyHost lower-cases a proxy hostname and strips a trailing
+// dot, so cache lookups and allowlist checks agree on one spelling.
+func normalizeProxyHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// preemptiveBasic returns the Proxy-Authorization header value to send
+// proactively to the given proxy host, and whether to send one at all.
+//
+// It only fires for hosts recorded by recordBasicSuccess, i.e. hosts
+// that have already challenged for and accepted Basic during this
+// session — alpaca never volunteers credentials to a host that hasn't
+// asked. The host allowlist and the authenticator's own applicableTo
+// are re-checked here as defence in depth, so the cache can never
+// widen what the picker would permit.
+func (c *authChain) preemptiveBasic(proxyHost string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	host := normalizeProxyHost(proxyHost)
+	c.mu.Lock()
+	known := c.basicKnown[host]
+	c.mu.Unlock()
+	if !known || !c.allowedHost(host) {
+		return "", false
+	}
+	for _, m := range c.methods {
+		if b, ok := m.(*basicAuthenticator); ok && b.applicableTo(host) {
+			return "Basic " + b.encoded, true
+		}
+	}
+	return "", false
+}
+
+// recordBasicSuccess remembers that the given proxy host accepted our
+// Basic credentials, enabling preemptiveBasic for it. Callers invoke
+// this from the retry helpers when the Basic method wins, which means
+// the host has already passed the picker's allowlist and scheme checks.
+func (c *authChain) recordBasicSuccess(proxyHost string) {
+	if c == nil {
+		return
+	}
+	host := normalizeProxyHost(proxyHost)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.basicKnown[host] {
+		return
+	}
+	if c.basicKnown == nil {
+		c.basicKnown = make(map[string]bool)
+	}
+	c.basicKnown[host] = true
+	log.Printf("Proxy %q accepted Basic credentials; "+
+		"sending them preemptively from now on", host)
+}
+
+// forgetBasic drops the given proxy host from the preemptive cache.
+// Called when a preemptively authenticated request still comes back
+// 407 — the password may have changed, or the proxy stopped accepting
+// Basic — so the next request goes back to the challenge-driven flow.
+func (c *authChain) forgetBasic(proxyHost string) {
+	if c == nil {
+		return
+	}
+	host := normalizeProxyHost(proxyHost)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.basicKnown[host] {
+		delete(c.basicKnown, host)
+		log.Printf("Proxy %q rejected preemptive Basic credentials; "+
+			"reverting to challenge-driven authentication", host)
+	}
 }
 
 // allowedHost reports whether the given proxy hostname is permitted to

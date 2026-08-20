@@ -42,7 +42,7 @@ alpaca/
 ├── transport.go           # Low-level connection management for CONNECT tunnels
 ├── authenticator.go       # NTLM authentication
 ├── basicauth.go           # Basic HTTP proxy authentication
-├── multiauth.go           # authChain: picks authenticators for a 407 response
+├── multiauth.go           # authChain: picks methods, caches preemptive Basic
 ├── kerberos*.go           # Kerberos/Negotiate auth (macOS-specific)
 ├── credentials.go         # Credential sourcing (terminal, env, keyring)
 ├── keyring*.go            # System keyring integration per platform
@@ -102,8 +102,31 @@ header is a protocol violation. The picker returns zero candidates in
 that case so no credentials of any scheme are sent. Chrome and Firefox
 take the same line.
 
+Preemptive Basic: besides picking, the chain carries a small piece of
+state — the set of proxy hosts that have already challenged for Basic
+*and* accepted our credentials (`basicKnown`, guarded by a mutex since
+the chain is shared across request goroutines). For those hosts,
+`connectViaProxy` and `proxyRequest` set `Proxy-Authorization` up front
+via `preemptiveBasic()`, which saves a 407 round-trip and (on the
+CONNECT path) a re-dial per connection. RFC 7617 §2.2 endorses this for
+Basic. The invariants:
+
+- Credentials are NEVER volunteered to a host that hasn't already asked
+  for and accepted Basic in this session, so the cache can only ever
+  shorten an exchange that already succeeded once.
+- Only Basic. NTLM and Negotiate are challenge-driven by design.
+- The host allowlist is re-checked on every preemptive send, not just
+  when learning, so tightening it takes effect immediately.
+- A 407 in response to a preemptive attempt drops the cache entry
+  (`forgetBasic`) and falls back to the normal challenge-driven flow —
+  this is what recovers from a changed password.
+- On the plain-HTTP path the header is only set when a proxy is actually
+  in the request context; a DIRECT request must not carry proxy
+  credentials to the origin server.
+
 See `multiauth.go` for the picker's host-policy and per-authenticator
-applicability rules.
+applicability rules, and `preemptiveauth_test.go` for the tests that pin
+the invariants above.
 
 ### Key Interfaces
 
@@ -111,8 +134,9 @@ applicability rules.
   (NTLM), `basicAuthenticator`, and `negotiateAuthenticator`. Methods:
   `do(req, rt) (resp, err)`, `scheme()`, `applicableTo(host)`.
 - `*authChain` (in `multiauth.go`) — picks the ordered list of
-  authenticators to try given the schemes the proxy advertised. NOT a
-  `proxyAuthenticator` itself.
+  authenticators to try given the schemes the proxy advertised, and
+  remembers which proxy hosts accept Basic so it can be sent
+  preemptively. NOT a `proxyAuthenticator` itself.
 
 ## Build & Test
 
