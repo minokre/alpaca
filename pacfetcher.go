@@ -204,7 +204,7 @@ func (pf *pacFetcher) download() []byte {
 			return nil
 		}
 		pf.connected = true
-		return pac
+		return decodePACtoUTF8(pac, "")
 	}
 
 	pac, err := decodeDataURL(pacurl)
@@ -215,7 +215,7 @@ func (pf *pacFetcher) download() []byte {
 
 	if pac != nil {
 		pf.connected = true
-		return pac
+		return decodePACtoUTF8(pac, "")
 	}
 
 	resp, err := requireOK(pf.client.Get(pacurl))
@@ -235,7 +235,7 @@ func (pf *pacFetcher) download() []byte {
 	_, err = io.CopyN(&buf, resp.Body, maxResponseBytes)
 	if err == io.EOF {
 		pf.connected = true
-		return buf.Bytes()
+		return decodePACtoUTF8(buf.Bytes(), resp.Header.Get("Content-Type"))
 	} else if err != nil {
 		log.Printf("Error reading PAC JS from response body: %q", err)
 		return nil
