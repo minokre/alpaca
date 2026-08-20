@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -60,6 +61,28 @@ func (nm *fakeNetMonitor) addrsChanged() bool {
 	tmp := nm.changed
 	nm.changed = false
 	return tmp
+}
+
+// pacServerWhichIsDown refuses to serve the PAC script until up is set, like a PAC server that
+// can't be reached until a VPN connection has come up.
+type pacServerWhichIsDown struct {
+	up bool
+}
+
+func (s *pacServerWhichIsDown) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if !s.up {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write([]byte("test script"))
+}
+
+// pinRetryDelays shortens the retry delays for the duration of a test.
+func pinRetryDelays(t *testing.T, initial, max time.Duration) {
+	t.Helper()
+	oldInitial, oldMax := initialRetryDelay, maxRetryDelay
+	t.Cleanup(func() { initialRetryDelay, maxRetryDelay = oldInitial, oldMax })
+	initialRetryDelay, maxRetryDelay = initial, max
 }
 
 func TestDownload(t *testing.T) {
@@ -104,6 +127,56 @@ func TestDownloadWithNetworkChanges(t *testing.T) {
 	pf.pacFinder = newPacFinder(s2.URL)
 	assert.Equal(t, []byte("test script 2"), pf.download())
 	assert.True(t, pf.isConnected())
+}
+
+// TestRetryAfterFailedDownload covers the case where the PAC server can't be reached when alpaca
+// starts up, and becomes reachable later without the machine's addresses changing. Before the
+// retry existed, this left every request on DIRECT indefinitely.
+func TestRetryAfterFailedDownload(t *testing.T) {
+	pinRetryDelays(t, time.Millisecond, time.Millisecond)
+	s := &pacServerWhichIsDown{}
+	server := httptest.NewServer(s)
+	defer server.Close()
+	// The monitor reports a change once, for the first attempt, and never again.
+	nm := &fakeNetMonitor{true}
+	pf := newPACFetcher(server.URL)
+	pf.monitor = nm
+
+	require.Nil(t, pf.download())
+	require.False(t, pf.isConnected())
+	require.False(t, nm.addrsChanged(), "the test relies on no further network changes")
+
+	s.up = true
+	time.Sleep(5 * time.Millisecond)
+	assert.Equal(t, []byte("test script"), pf.download())
+	assert.True(t, pf.isConnected())
+	// A successful download clears the schedule, so we stop asking.
+	assert.Zero(t, pf.retryDelay)
+	assert.False(t, pf.retryDue())
+}
+
+func TestRetryDelayBacksOff(t *testing.T) {
+	pinRetryDelays(t, time.Second, 4*time.Second)
+	server := httptest.NewServer(&pacServerWhichIsDown{})
+	defer server.Close()
+	pf := newPACFetcher(server.URL)
+	expected := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 4 * time.Second}
+	for i, want := range expected {
+		// Force an attempt rather than waiting for the delay to elapse.
+		pf.monitor = &fakeNetMonitor{true}
+		require.Nil(t, pf.download())
+		assert.Equal(t, want, pf.retryDelay, "attempt %d", i+1)
+	}
+}
+
+func TestNoRetryWithoutPACURL(t *testing.T) {
+	pf := newPACFetcher("")
+	pf.monitor = &fakeNetMonitor{true}
+	assert.Nil(t, pf.download())
+	assert.False(t, pf.isConnected())
+	// There's nothing to retry, so we shouldn't be scheduling attempts.
+	assert.Zero(t, pf.retryDelay)
+	assert.False(t, pf.retryDue())
 }
 
 func TestResponseLimit(t *testing.T) {

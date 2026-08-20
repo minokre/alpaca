@@ -41,11 +41,21 @@ const maxDataURLLength = 512 * 1024 * 1024
 // https://cs.chromium.org/chromium/src/net/proxy_resolution/proxy_resolution_service.cc?l=96&rcl=3db5f65968c3ecab3932c1ff7367ad28834f9502
 var delayAfterFailedDownload = 2 * time.Second
 
+// How long to wait before looking for the PAC file again after giving up on it, and the ceiling
+// that this delay backs off to. Until a PAC script has been loaded, every request is sent
+// DIRECT, so it's worth looking again reasonably eagerly at first.
+var (
+	initialRetryDelay = 5 * time.Second
+	maxRetryDelay     = 5 * time.Minute
+)
+
 type pacFetcher struct {
-	pacFinder *pacFinder
-	monitor   netMonitor
-	client    *http.Client
-	connected bool
+	pacFinder   *pacFinder
+	monitor     netMonitor
+	client      *http.Client
+	connected   bool
+	nextAttempt time.Time
+	retryDelay  time.Duration
 	//cache  []byte
 	//modified time.Time
 	//fetched time.Time
@@ -176,24 +186,63 @@ func decodeDataURL(uri string) ([]byte, error) {
 func (pf *pacFetcher) download() []byte {
 	// TODO: Combine pacChanged() and findPACURL() as described in
 	// https://github.com/samuong/alpaca/pull/156#issuecomment-3125070335
-	if !pf.monitor.addrsChanged() && !pf.pacFinder.pacChanged() {
+	if !pf.monitor.addrsChanged() && !pf.pacFinder.pacChanged() && !pf.retryDue() {
 		return nil
 	}
+	pacjs, configured := pf.downloadNow()
+	pf.scheduleRetry(configured)
+	return pacjs
+}
+
+// retryDue reports whether a scheduled retry has come due.
+func (pf *pacFetcher) retryDue() bool {
+	return !pf.nextAttempt.IsZero() && !time.Now().Before(pf.nextAttempt)
+}
+
+// scheduleRetry arranges for another attempt when this one didn't leave us with a usable PAC
+// script. Without it, a PAC server that can't be reached at startup would keep every request on
+// DIRECT until the machine's network addresses happen to change; alpaca starting before a VPN
+// connection has finished coming up is a common way to end up in that state.
+//
+// The delay doubles with each consecutive failure, up to maxRetryDelay, so a server that comes
+// back shortly is picked up quickly while one that stays away is polled rarely. If no PAC URL is
+// configured at all there is nothing to retry, so don't schedule anything.
+func (pf *pacFetcher) scheduleRetry(configured bool) {
+	if pf.connected || !configured {
+		pf.retryDelay = 0
+		pf.nextAttempt = time.Time{}
+		return
+	}
+	if pf.retryDelay == 0 {
+		pf.retryDelay = initialRetryDelay
+	} else if pf.retryDelay < maxRetryDelay {
+		pf.retryDelay *= 2
+		if pf.retryDelay > maxRetryDelay {
+			pf.retryDelay = maxRetryDelay
+		}
+	}
+	pf.nextAttempt = time.Now().Add(pf.retryDelay)
+	log.Printf("No PAC script available, will try again in %v", pf.retryDelay)
+}
+
+// downloadNow fetches the PAC script from wherever it lives. The second result reports whether a
+// PAC URL is configured at all, i.e. whether retrying could ever help.
+func (pf *pacFetcher) downloadNow() ([]byte, bool) {
 	pf.connected = false
 
-	// We've just detected a change in network state, so close any "idle"
-	// connections from the previous network. This forces a fresh DNS
-	// lookup and TCP dial during the next PAC download. For context, see
+	// The network state may have changed since the last attempt, so close any "idle"
+	// connections from the previous network. This forces a fresh DNS lookup and TCP dial
+	// during the next PAC download. For context, see
 	// <https://github.com/samuong/alpaca/issues/165>.
 	pf.client.CloseIdleConnections()
 
 	pacurl, err := pf.pacFinder.findPACURL()
 	if err != nil {
 		log.Printf("Error while trying to detect PAC URL: %v", err)
-		return nil
+		return nil, true
 	} else if pacurl == "" {
 		log.Println("No PAC URL specified or detected; all requests will be made directly")
-		return nil
+		return nil, false
 	}
 
 	log.Printf("Attempting to download PAC from %s", pacurl)
@@ -201,21 +250,21 @@ func (pf *pacFetcher) download() []byte {
 		pac, err := readLocalPAC(pacurl)
 		if err != nil {
 			log.Printf("Error reading local PAC file: %v", err)
-			return nil
+			return nil, true
 		}
 		pf.connected = true
-		return decodePACtoUTF8(pac, "")
+		return decodePACtoUTF8(pac, ""), true
 	}
 
 	pac, err := decodeDataURL(pacurl)
 	if err != nil {
 		log.Printf("Error downloading PAC file: %v", err)
-		return nil
+		return nil, true
 	}
 
 	if pac != nil {
 		pf.connected = true
-		return decodePACtoUTF8(pac, "")
+		return decodePACtoUTF8(pac, ""), true
 	}
 
 	resp, err := requireOK(pf.client.Get(pacurl))
@@ -227,7 +276,7 @@ func (pf *pacFetcher) download() []byte {
 		time.Sleep(delayAfterFailedDownload)
 		if resp, err = requireOK(pf.client.Get(pacurl)); err != nil {
 			log.Printf("Error downloading PAC file, giving up: %q", err)
-			return nil
+			return nil, true
 		}
 	}
 	defer resp.Body.Close() //nolint:errcheck
@@ -235,13 +284,13 @@ func (pf *pacFetcher) download() []byte {
 	_, err = io.CopyN(&buf, resp.Body, maxResponseBytes)
 	if err == io.EOF {
 		pf.connected = true
-		return decodePACtoUTF8(buf.Bytes(), resp.Header.Get("Content-Type"))
+		return decodePACtoUTF8(buf.Bytes(), resp.Header.Get("Content-Type")), true
 	} else if err != nil {
 		log.Printf("Error reading PAC JS from response body: %q", err)
-		return nil
+		return nil, true
 	} else {
 		log.Printf("PAC JS is too big (limit is %d bytes)", maxResponseBytes)
-		return nil
+		return nil, true
 	}
 }
 
