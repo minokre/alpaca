@@ -1,4 +1,4 @@
-// Copyright 2019, 2021, 2023, 2024, 2025 The Alpaca Authors
+// Copyright 2019, 2021, 2023, 2024, 2025, 2026 The Alpaca Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -24,25 +25,39 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dop251/goja"
 	"github.com/gobwas/glob"
-	"github.com/robertkrimen/otto"
 )
 
 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Proxy_servers_and_tunneling/Proxy_Auto-Configuration_(PAC)_file
 
+// pacFunc is a PAC helper implemented in Go. It takes the runtime it belongs to, because goja
+// values are bound to the runtime that created them.
+type pacFunc func(vm *goja.Runtime, call goja.FunctionCall) goja.Value
+
+// pacTimeFunc is a PAC helper whose result depends on the current time.
+type pacTimeFunc func(vm *goja.Runtime, call goja.FunctionCall, now time.Time) goja.Value
+
 type PACRunner struct {
-	vm *otto.Otto
+	vm *goja.Runtime
 	sync.Mutex
 }
 
 func (pr *PACRunner) Update(pacjs []byte) error {
-	vm := otto.New()
+	vm := goja.New()
 	var err error
-	set := func(name string, handler func(otto.FunctionCall) otto.Value) {
+	set := func(name string, handler pacFunc) {
 		if err != nil {
 			return
 		}
-		err = vm.Set(name, handler)
+		err = vm.Set(name, func(call goja.FunctionCall) goja.Value {
+			return handler(vm, call)
+		})
+	}
+	setAt := func(name string, handler pacTimeFunc) {
+		set(name, func(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
+			return handler(vm, call, time.Now())
+		})
 	}
 	set("isPlainHostName", isPlainHostName)
 	set("dnsDomainIs", dnsDomainIs)
@@ -55,22 +70,17 @@ func (pr *PACRunner) Update(pacjs []byte) error {
 	set("myIpAddressEx", myIpAddressEx)
 	set("dnsDomainLevels", dnsDomainLevels)
 	set("shExpMatch", shExpMatch)
-	set("weekdayRange", func(fc otto.FunctionCall) otto.Value {
-		return weekdayRange(fc, time.Now())
-	})
-	set("dateRange", func(fc otto.FunctionCall) otto.Value {
-		return dateRange(fc, time.Now())
-	})
-	set("timeRange", func(fc otto.FunctionCall) otto.Value {
-		return timeRange(fc, time.Now())
-	})
+	setAt("weekdayRange", weekdayRange)
+	setAt("dateRange", dateRange)
+	setAt("timeRange", timeRange)
 	if err != nil {
 		return err
 	}
-	_, err = vm.Run(pacjs)
-	if err != nil {
+	if _, err = vm.RunScript("proxy.pac", string(pacjs)); err != nil {
 		return err
 	}
+	pr.Lock()
+	defer pr.Unlock()
 	pr.vm = vm
 	return nil
 }
@@ -78,6 +88,9 @@ func (pr *PACRunner) Update(pacjs []byte) error {
 func (pr *PACRunner) FindProxyForURL(u url.URL) (string, error) {
 	pr.Lock()
 	defer pr.Unlock()
+	if pr.vm == nil {
+		return "", errors.New("no PAC JS has been loaded")
+	}
 	if u.Scheme == "" {
 		// When a net/http Server parses a CONNECT request, the URL will
 		// have no Scheme. In that case, assume the scheme is "https".
@@ -94,65 +107,84 @@ func (pr *PACRunner) FindProxyForURL(u url.URL) (string, error) {
 		u.RawQuery = ""
 		u.Fragment = ""
 	}
-	val, err := pr.vm.Call("FindProxyForURL", nil, u.String(), u.Hostname())
+	findProxyForURL, ok := goja.AssertFunction(pr.vm.Get("FindProxyForURL"))
+	if !ok {
+		return "", errors.New("PAC JS doesn't define a FindProxyForURL function")
+	}
+	val, err := findProxyForURL(goja.Undefined(),
+		pr.vm.ToValue(u.String()), pr.vm.ToValue(u.Hostname()))
 	if err != nil {
 		return "", err
-	} else if !val.IsString() {
+	}
+	str, ok := val.Export().(string)
+	if !ok {
 		return "", errors.New("FindProxyForURL didn't return a string")
 	}
-	return val.String(), nil
+	return str, nil
 }
 
-func toValue(unwrapped interface{}) otto.Value {
-	wrapped, err := otto.ToValue(unwrapped)
-	if err != nil {
-		return otto.UndefinedValue()
-	} else {
-		return wrapped
+// lastArg returns the final argument of a call, or undefined if there are none. Unlike otto,
+// goja's FunctionCall.Argument panics on a negative index, so the time-based helpers can't just
+// ask for Argument(len(args)-1).
+func lastArg(call goja.FunctionCall) goja.Value {
+	if len(call.Arguments) == 0 {
+		return goja.Undefined()
+	}
+	return call.Arguments[len(call.Arguments)-1]
+}
+
+// isNumber reports whether a value is a JavaScript number, as opposed to a string that merely
+// looks like one. dateRange needs the distinction to tell "JAN" apart from 1.
+func isNumber(v goja.Value) bool {
+	switch v.Export().(type) {
+	case int64, float64:
+		return true
+	default:
+		return false
 	}
 }
 
-func isPlainHostName(call otto.FunctionCall) otto.Value {
+func isPlainHostName(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
-	return toValue(!strings.ContainsRune(host, '.'))
+	return vm.ToValue(!strings.ContainsRune(host, '.'))
 }
 
-func dnsDomainIs(call otto.FunctionCall) otto.Value {
+func dnsDomainIs(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
 	domain := call.Argument(1).String()
-	return toValue(strings.HasSuffix(host, domain))
+	return vm.ToValue(strings.HasSuffix(host, domain))
 }
 
-func localHostOrDomainIs(call otto.FunctionCall) otto.Value {
+func localHostOrDomainIs(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
 	hostdom := call.Argument(1).String()
-	return toValue(host == hostdom || strings.HasPrefix(hostdom, host+"."))
+	return vm.ToValue(host == hostdom || strings.HasPrefix(hostdom, host+"."))
 }
 
-func isResolvable(call otto.FunctionCall) otto.Value {
+func isResolvable(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
 	_, err := net.LookupHost(host)
-	return toValue(err == nil)
+	return vm.ToValue(err == nil)
 }
 
-func isInNet(call otto.FunctionCall) otto.Value {
+func isInNet(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
 	pattern := call.Argument(1).String()
 	mask := call.Argument(2).String()
 	buf := net.ParseIP(mask).To4()
 	if len(buf) != 4 {
-		return toValue(false)
+		return vm.ToValue(false)
 	}
 
 	m := net.IPv4Mask(buf[0], buf[1], buf[2], buf[3])
 	maskedIP := resolve(host).Mask(m)
 	maskedPattern := net.ParseIP(pattern).To4().Mask(m)
-	return toValue(maskedIP.Equal(maskedPattern))
+	return vm.ToValue(maskedIP.Equal(maskedPattern))
 }
 
-func dnsResolve(call otto.FunctionCall) otto.Value {
+func dnsResolve(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
-	return toValue(resolve(host).String())
+	return vm.ToValue(resolve(host).String())
 }
 
 func resolve(host string) net.IP {
@@ -174,37 +206,37 @@ func resolve(host string) net.IP {
 	return nil
 }
 
-func convertAddr(call otto.FunctionCall) otto.Value {
+func convertAddr(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	ipaddr := call.Argument(0).String()
 	ipv4 := net.ParseIP(ipaddr).To4()
 	if ipv4 == nil {
-		return toValue(0)
+		return vm.ToValue(0)
 	}
-	return toValue(binary.BigEndian.Uint32(ipv4))
+	return vm.ToValue(binary.BigEndian.Uint32(ipv4))
 }
 
-func myIpAddress(_ otto.FunctionCall) otto.Value {
+func myIpAddress(vm *goja.Runtime, _ goja.FunctionCall) goja.Value {
 	// https://chromium.googlesource.com/chromium/src/+/ee43fa5328856129f46566b2ea1be5811739681c/net/docs/proxy.md#Resolving-client_s-IP-address-within-a-PAC-script-using-myIpAddress
 	if localAddr := probeRoute("8.8.8.8"); localAddr != "" {
-		return toValue(localAddr)
+		return vm.ToValue(localAddr)
 	}
 	if ips := resolveHostname(false); len(ips) > 0 {
-		return toValue(ips[0].String())
+		return vm.ToValue(ips[0].String())
 	}
 	private := []string{"10.0.0.0", "172.16.0.0", "192.168.0.0"}
 	for _, remoteAddr := range private {
 		if localAddr := probeRoute(remoteAddr); localAddr != "" {
-			return toValue(localAddr)
+			return vm.ToValue(localAddr)
 		}
 	}
-	return toValue("127.0.0.1")
+	return vm.ToValue("127.0.0.1")
 }
 
-func myIpAddressEx(_ otto.FunctionCall) otto.Value {
+func myIpAddressEx(vm *goja.Runtime, _ goja.FunctionCall) goja.Value {
 	// https://chromium.googlesource.com/chromium/src/+/ee43fa5328856129f46566b2ea1be5811739681c/net/docs/proxy.md#resolving-client_s-ip-address-within-a-pac-script-using-myipaddressex
 	public := []string{"8.8.8.8", "2001:4860:4860::8888"}
 	if ips := probeRoutes(public); ips != "" {
-		return toValue(ips)
+		return vm.ToValue(ips)
 	}
 	if ips := resolveHostname(true); len(ips) > 0 {
 		var b strings.Builder
@@ -213,11 +245,11 @@ func myIpAddressEx(_ otto.FunctionCall) otto.Value {
 			b.WriteRune(';')
 			b.WriteString(ip.String())
 		}
-		return toValue(b.String())
+		return vm.ToValue(b.String())
 	}
 	private := []string{"10.0.0.0", "172.16.0.0", "192.168.0.0", "FC00::"}
 	ips := probeRoutes(private)
-	return toValue(ips)
+	return vm.ToValue(ips)
 }
 
 func probeRoutes(addresses []string) string {
@@ -281,23 +313,23 @@ func resolveHostname(ipv6 bool) []net.IP {
 	return addrs
 }
 
-func dnsDomainLevels(call otto.FunctionCall) otto.Value {
+func dnsDomainLevels(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	host := call.Argument(0).String()
-	return toValue(strings.Count(host, "."))
+	return vm.ToValue(strings.Count(host, "."))
 }
 
-func shExpMatch(call otto.FunctionCall) otto.Value {
+func shExpMatch(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	str := call.Argument(0).String()
 	shexp := call.Argument(1).String()
 	g, err := glob.Compile(shexp)
 	if err != nil {
-		return otto.UndefinedValue()
+		return goja.Undefined()
 	}
-	return toValue(g.Match(str))
+	return vm.ToValue(g.Match(str))
 }
 
-func weekdayRange(call otto.FunctionCall, now time.Time) otto.Value {
-	if call.Argument(len(call.ArgumentList)-1).String() == "GMT" {
+func weekdayRange(vm *goja.Runtime, call goja.FunctionCall, now time.Time) goja.Value {
+	if lastArg(call).String() == "GMT" {
 		now = now.In(time.UTC)
 	}
 	weekdays := map[string]time.Weekday{
@@ -306,21 +338,21 @@ func weekdayRange(call otto.FunctionCall, now time.Time) otto.Value {
 	}
 	wd1, ok := weekdays[call.Argument(0).String()]
 	if !ok {
-		return otto.UndefinedValue()
+		return goja.Undefined()
 	}
 	wd2, ok := weekdays[call.Argument(1).String()]
 	if !ok {
-		return toValue(now.Weekday() == wd1)
+		return vm.ToValue(now.Weekday() == wd1)
 	} else if wd1 <= wd2 {
-		return toValue(wd1 <= now.Weekday() && now.Weekday() <= wd2)
+		return vm.ToValue(wd1 <= now.Weekday() && now.Weekday() <= wd2)
 	} else {
-		return toValue(wd1 == now.Weekday() || wd2 == now.Weekday())
+		return vm.ToValue(wd1 == now.Weekday() || wd2 == now.Weekday())
 	}
 }
 
-func dateRange(call otto.FunctionCall, now time.Time) otto.Value {
-	argc := len(call.ArgumentList)
-	if call.Argument(argc-1).String() == "GMT" {
+func dateRange(vm *goja.Runtime, call goja.FunctionCall, now time.Time) goja.Value {
+	argc := len(call.Arguments)
+	if lastArg(call).String() == "GMT" {
 		now = now.In(time.UTC)
 		argc--
 	}
@@ -337,11 +369,9 @@ func dateRange(call otto.FunctionCall, now time.Time) otto.Value {
 	}
 
 	for i := 0; i < argc; i++ {
-		if call.Argument(i).IsNumber() {
-			n, err := call.Argument(i).ToInteger()
-			if err != nil {
-				return otto.UndefinedValue()
-			} else if 1 <= n && n <= 31 {
+		if isNumber(call.Argument(i)) {
+			n := call.Argument(i).ToInteger()
+			if 1 <= n && n <= 31 {
 				days = append(days, int(n))
 			} else {
 				years = append(years, int(n))
@@ -349,7 +379,7 @@ func dateRange(call otto.FunctionCall, now time.Time) otto.Value {
 		} else if month, ok := monthmap[call.Argument(i).String()]; ok {
 			months = append(months, month)
 		} else {
-			return otto.UndefinedValue()
+			return goja.Undefined()
 		}
 	}
 
@@ -357,13 +387,13 @@ func dateRange(call otto.FunctionCall, now time.Time) otto.Value {
 	case 1:
 		// One (possibly partial) date provided; match it against the current date.
 		if len(days) == 1 && days[0] != now.Day() {
-			return otto.FalseValue()
+			return vm.ToValue(false)
 		} else if len(months) == 1 && months[0] != now.Month() {
-			return otto.FalseValue()
+			return vm.ToValue(false)
 		} else if len(years) == 1 && years[0] != now.Year() {
-			return otto.FalseValue()
+			return vm.ToValue(false)
 		} else {
-			return otto.TrueValue()
+			return vm.ToValue(true)
 		}
 	case 2:
 		// Two dates provided; check that the current date is inside the range.
@@ -382,10 +412,10 @@ func dateRange(call otto.FunctionCall, now time.Time) otto.Value {
 		ns, loc := now.Nanosecond(), now.Location()
 		start := time.Date(y1, m1, d1, h, m, s, ns, loc)
 		end := time.Date(y2, m2, d2, h, m, s, ns, loc)
-		return toValue(!start.After(now) && !end.Before(now))
+		return vm.ToValue(!start.After(now) && !end.Before(now))
 	default:
 		// Zero, three or more dates provided. Something's wrong.
-		return otto.UndefinedValue()
+		return goja.Undefined()
 	}
 }
 
@@ -399,20 +429,22 @@ func max(a, b, c int) int {
 	}
 }
 
-func timeRange(call otto.FunctionCall, now time.Time) otto.Value {
-	argc := len(call.ArgumentList)
-	if call.Argument(argc-1).String() == "GMT" {
+func timeRange(vm *goja.Runtime, call goja.FunctionCall, now time.Time) goja.Value {
+	argc := len(call.Arguments)
+	if lastArg(call).String() == "GMT" {
 		now = now.In(time.UTC)
 		argc--
 	}
 	h1, m1, s1, h2, m2, s2 := 0, 0, 0, 0, 0, 0
-	var err error
+	invalid := false
 	toInt := func(idx int) int {
-		val, err2 := call.Argument(idx).ToInteger()
-		if err2 != nil {
-			err = err2
+		// goja's ToInteger turns anything non-numeric into 0, so check for NaN explicitly
+		// rather than silently treating a bad argument as midnight.
+		f := call.Argument(idx).ToFloat()
+		if math.IsNaN(f) {
+			invalid = true
 		}
-		return int(val)
+		return int(f)
 	}
 	switch argc {
 	case 1:
@@ -428,12 +460,12 @@ func timeRange(call otto.FunctionCall, now time.Time) otto.Value {
 		h1, m1, s1 = toInt(0), toInt(1), toInt(2)
 		h2, m2, s2 = toInt(3), toInt(4), toInt(5)
 	default:
-		return otto.UndefinedValue()
+		return goja.Undefined()
 	}
-	if err != nil {
-		return otto.UndefinedValue()
+	if invalid {
+		return goja.Undefined()
 	}
 	start := time.Date(now.Year(), now.Month(), now.Day(), h1, m1, s1, 0, now.Location())
 	end := time.Date(now.Year(), now.Month(), now.Day(), h2, m2, s2, 0, now.Location())
-	return toValue(!start.After(now) && end.After(now))
+	return vm.ToValue(!start.After(now) && end.After(now))
 }

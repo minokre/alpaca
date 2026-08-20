@@ -1,4 +1,4 @@
-// Copyright 2019, 2020, 2021, 2023, 2024 The Alpaca Authors
+// Copyright 2019, 2020, 2021, 2023, 2024, 2026 The Alpaca Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,47 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robertkrimen/otto"
+	"github.com/dop251/goja"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// callJS looks up a function in the runtime and calls it, converting args to JavaScript values.
+func callJS(t *testing.T, vm *goja.Runtime, name string, args ...interface{}) goja.Value {
+	t.Helper()
+	fn, ok := goja.AssertFunction(vm.Get(name))
+	require.True(t, ok, "%s is not a function", name)
+	values := make([]goja.Value, len(args))
+	for i, arg := range args {
+		values[i] = vm.ToValue(arg)
+	}
+	value, err := fn(goja.Undefined(), values...)
+	require.NoError(t, err)
+	return value
+}
+
+// callPACFunc registers a PAC helper in a fresh runtime and calls it from JavaScript, which is
+// how the PAC script itself reaches it.
+func callPACFunc(t *testing.T, name string, fn pacFunc, args ...interface{}) goja.Value {
+	t.Helper()
+	vm := goja.New()
+	require.NoError(t, vm.Set(name, func(call goja.FunctionCall) goja.Value {
+		return fn(vm, call)
+	}))
+	return callJS(t, vm, name, args...)
+}
+
+// callPACTimeFunc is callPACFunc for the helpers that depend on the current time, with the clock
+// pinned to now.
+func callPACTimeFunc(t *testing.T, name string, fn pacTimeFunc, now time.Time,
+	args ...interface{}) goja.Value {
+	t.Helper()
+	vm := goja.New()
+	require.NoError(t, vm.Set(name, func(call goja.FunctionCall) goja.Value {
+		return fn(vm, call, now)
+	}))
+	return callJS(t, vm, name, args...)
+}
 
 func TestDirect(t *testing.T) {
 	var pr PACRunner
@@ -58,6 +95,49 @@ func TestFindProxyForURL(t *testing.T) {
 	}
 }
 
+// TestNegativeLookahead covers a regular expression that Go's regexp package can't compile.
+// Corporate PAC files routinely use negative lookahead to carve exceptions out of a domain, so
+// the JavaScript engine has to support it.
+func TestNegativeLookahead(t *testing.T) {
+	var pr PACRunner
+	pacjs := []byte(`function FindProxyForURL(url, host) {
+		var re = /^(?!intranet|www)(.*[.])?example[.]com$/;
+		return re.test(host) ? "PROXY proxy.test:8080" : "DIRECT";
+	}`)
+	require.NoError(t, pr.Update(pacjs))
+	tests := []struct {
+		host, expected string
+	}{
+		{"shop.example.com", "PROXY proxy.test:8080"},
+		{"example.com", "PROXY proxy.test:8080"},
+		{"intranet.example.com", "DIRECT"},
+		{"www.example.com", "DIRECT"},
+		{"example.org", "DIRECT"},
+	}
+	for _, test := range tests {
+		t.Run(test.host, func(t *testing.T) {
+			proxy, err := pr.FindProxyForURL(url.URL{Scheme: "https", Host: test.host})
+			require.NoError(t, err)
+			assert.Equal(t, test.expected, proxy)
+		})
+	}
+}
+
+// TestFindProxyForURLBeforeUpdate checks that calling into a runner that never loaded a script
+// reports an error instead of dereferencing a nil runtime.
+func TestFindProxyForURLBeforeUpdate(t *testing.T) {
+	var pr PACRunner
+	_, err := pr.FindProxyForURL(url.URL{Scheme: "https", Host: "anz.com"})
+	assert.Error(t, err)
+}
+
+func TestMissingFindProxyForURL(t *testing.T) {
+	var pr PACRunner
+	require.NoError(t, pr.Update([]byte(`var x = 1;`)))
+	_, err := pr.FindProxyForURL(url.URL{Scheme: "https", Host: "anz.com"})
+	assert.Error(t, err)
+}
+
 func TestIsPlainHostName(t *testing.T) {
 	tests := []struct {
 		host     string
@@ -68,13 +148,8 @@ func TestIsPlainHostName(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("isPlainHostName", isPlainHostName))
-			value, err := vm.Call("isPlainHostName", nil, test.host)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "isPlainHostName", isPlainHostName, test.host)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
 }
@@ -91,13 +166,8 @@ func TestDnsDomainIs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host+" "+test.domain, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("dnsDomainIs", dnsDomainIs))
-			value, err := vm.Call("dnsDomainIs", nil, test.host, test.domain)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "dnsDomainIs", dnsDomainIs, test.host, test.domain)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
 }
@@ -116,13 +186,9 @@ func TestLocalHostOrDomainIs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("localHostOrDomainIs", localHostOrDomainIs))
-			value, err := vm.Call("localHostOrDomainIs", nil, test.host, test.hostdom)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "localHostOrDomainIs", localHostOrDomainIs,
+				test.host, test.hostdom)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
 }
@@ -137,13 +203,8 @@ func TestIsResolvable(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("isResolvable", isResolvable))
-			value, err := vm.Call("isResolvable", nil, test.host)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "isResolvable", isResolvable, test.host)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
 }
@@ -163,13 +224,8 @@ func TestIsInNet(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("isInNet", isInNet))
-			value, err := vm.Call("isInNet", nil, test.host, test.pattern, test.mask)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "isInNet", isInNet, test.host, test.pattern, test.mask)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
 }
@@ -184,13 +240,8 @@ func TestDnsResolve(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("dnsResolve", dnsResolve))
-			value, err := vm.Call("dnsResolve", nil, test.host)
-			require.NoError(t, err)
-			actual, err := value.ToString()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "dnsResolve", dnsResolve, test.host)
+			assert.Equal(t, test.expected, value.String())
 		})
 	}
 }
@@ -206,24 +257,15 @@ func TestConvertAddr(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.ipaddr, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("convert_addr", convertAddr))
-			value, err := vm.Call("convert_addr", nil, test.ipaddr)
-			require.NoError(t, err)
-			actual, err := value.ToInteger()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "convert_addr", convertAddr, test.ipaddr)
+			assert.Equal(t, test.expected, value.ToInteger())
 		})
 	}
 }
 
 func TestMyIpAddress(t *testing.T) {
-	vm := otto.New()
-	require.NoError(t, vm.Set("myIpAddress", myIpAddress))
-	value, err := vm.Call("myIpAddress", nil)
-	require.NoError(t, err)
-	output, err := value.ToString()
-	require.NoError(t, err)
+	value := callPACFunc(t, "myIpAddress", myIpAddress)
+	output := value.String()
 	// Check it's a valid IPv4 or IPv6 address.
 	assert.NotNil(t, net.ParseIP(output))
 	// Check that it's our IP address. Technically there's a race condition here (since both
@@ -250,13 +292,8 @@ func TestDnsDomainLevels(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.host, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("dnsDomainLevels", dnsDomainLevels))
-			value, err := vm.Call("dnsDomainLevels", nil, test.host)
-			require.NoError(t, err)
-			actual, err := value.ToInteger()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "dnsDomainLevels", dnsDomainLevels, test.host)
+			assert.Equal(t, test.expected, value.ToInteger())
 		})
 	}
 }
@@ -271,15 +308,19 @@ func TestShExpMatch(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.str+" "+test.shexp, func(t *testing.T) {
-			vm := otto.New()
-			require.NoError(t, vm.Set("shExpMatch", shExpMatch))
-			value, err := vm.Call("shExpMatch", nil, test.str, test.shexp)
-			require.NoError(t, err)
-			actual, err := value.ToBoolean()
-			require.NoError(t, err)
-			assert.Equal(t, test.expected, actual)
+			value := callPACFunc(t, "shExpMatch", shExpMatch, test.str, test.shexp)
+			assert.Equal(t, test.expected, value.ToBoolean())
 		})
 	}
+}
+
+// TestTimeFuncsWithoutArgs checks that the time-based helpers survive being called with no
+// arguments at all, which would otherwise index past the start of the argument list.
+func TestTimeFuncsWithoutArgs(t *testing.T) {
+	now := time.Now()
+	assert.NotPanics(t, func() { callPACTimeFunc(t, "weekdayRange", weekdayRange, now) })
+	assert.NotPanics(t, func() { callPACTimeFunc(t, "dateRange", dateRange, now) })
+	assert.NotPanics(t, func() { callPACTimeFunc(t, "timeRange", timeRange, now) })
 }
 
 func TestWeekdayRange(t *testing.T) {
@@ -314,17 +355,10 @@ func TestWeekdayRange(t *testing.T) {
 	for _, test := range tests {
 		for i, weekday := range weekdays {
 			t.Run(test.name+" "+weekday.name, func(t *testing.T) {
-				vm := otto.New()
-				f := func(fc otto.FunctionCall) otto.Value {
-					return weekdayRange(fc, weekday.t)
-				}
-				require.NoError(t, vm.Set("weekdayRange", f))
-				value, err := vm.Call("weekdayRange", nil, test.args...)
-				require.NoError(t, err)
-				actual, err := value.ToBoolean()
-				require.NoError(t, err)
+				value := callPACTimeFunc(t, "weekdayRange", weekdayRange, weekday.t,
+					test.args...)
 				expected := test.expectations[i] == 'Y'
-				assert.Equal(t, expected, actual)
+				assert.Equal(t, expected, value.ToBoolean())
 			})
 		}
 	}
@@ -444,16 +478,10 @@ func TestDateRange(t *testing.T) {
 	}
 
 	check := func(t *testing.T, args []interface{}, date string, expected bool) {
-		vm := otto.New()
 		now, err := time.Parse(time.RFC3339, date+"T05:00:00+10:00")
 		require.NoError(t, err)
-		f := func(fc otto.FunctionCall) otto.Value { return dateRange(fc, now) }
-		require.NoError(t, vm.Set("dateRange", f))
-		value, err := vm.Call("dateRange", nil, args...)
-		require.NoError(t, err)
-		actual, err := value.ToBoolean()
-		require.NoError(t, err)
-		assert.Equal(t, expected, actual)
+		value := callPACTimeFunc(t, "dateRange", dateRange, now, args...)
+		assert.Equal(t, expected, value.ToBoolean())
 	}
 
 	for _, test := range tests {
@@ -537,16 +565,10 @@ func TestTimeRange(t *testing.T) {
 	}
 
 	check := func(t *testing.T, args []interface{}, mocktime string, expected bool) {
-		vm := otto.New()
 		now, err := time.Parse(time.RFC3339, "2019-07-01T"+mocktime+"+10:00")
 		require.NoError(t, err)
-		f := func(fc otto.FunctionCall) otto.Value { return timeRange(fc, now) }
-		require.NoError(t, vm.Set("timeRange", f))
-		value, err := vm.Call("timeRange", nil, args...)
-		require.NoError(t, err)
-		actual, err := value.ToBoolean()
-		require.NoError(t, err)
-		assert.Equal(t, expected, actual)
+		value := callPACTimeFunc(t, "timeRange", timeRange, now, args...)
+		assert.Equal(t, expected, value.ToBoolean())
 	}
 
 	for _, test := range tests {
