@@ -278,15 +278,21 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	if err != nil {
-		// Without this line, an auth-chain refusal on the CONNECT
+		// Always say why. Without this, every failure on the CONNECT
 		// path surfaces to the client as a bare 502 with nothing in
-		// alpaca's log explaining why — the most common cause of
-		// "alpaca returned 502 and I don't know why". The picker
-		// already logged WHICH host was excluded; this line links
-		// that to the 502 the client actually saw.
+		// alpaca's log explaining it — the most common cause of
+		// "alpaca returned 502 and I don't know why". A filtering
+		// upstream proxy is the case that bites hardest: it refuses
+		// the tunnel, so the block page it would serve over plain
+		// HTTP never reaches the browser, and the reason is only
+		// visible here.
+		log.Printf("[%d] Error establishing CONNECT tunnel, "+
+			"returning 502 to client: %v", id, err)
+		// The auth-chain refusal gets an extra line, because the
+		// reason it was refused was logged by the picker earlier and
+		// this links the two together.
 		if errors.Is(err, errNoMatchingAuthMethod) {
-			log.Printf("[%d] No authenticator matched proxy %q; "+
-				"returning 502 to client", id, proxyURL.Host)
+			log.Printf("[%d] No authenticator matched proxy %q", id, proxyURL.Host)
 		}
 		w.WriteHeader(http.StatusBadGateway)
 		return
