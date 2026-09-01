@@ -29,7 +29,7 @@ func TestWrapPAC(t *testing.T) {
 	pac := `function FindProxyForURL(url, host) { return "DIRECT" }`
 	pw.Wrap([]byte(pac))
 	assert.Contains(t, pw.alpacaPAC, pac)
-	assert.Contains(t, pw.alpacaPAC, `"DIRECT" : "PROXY localhost:1234"`)
+	assert.Contains(t, pw.alpacaPAC, `"DIRECT" : "PROXY 127.0.0.1:1234"`)
 }
 
 func TestWrapEmptyPAC(t *testing.T) {
@@ -56,6 +56,6 @@ func TestPACServe(t *testing.T) {
 	body := string(b)
 	require.NoError(t, err)
 	assert.Contains(t, body, pac)
-	assert.Contains(t, body, `"DIRECT" : "PROXY localhost:1234"`)
+	assert.Contains(t, body, `"DIRECT" : "PROXY 127.0.0.1:1234"`)
 	_ = resp.Body.Close()
 }

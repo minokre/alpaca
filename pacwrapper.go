@@ -39,12 +39,19 @@ type PACWrapper struct {
 
 // PACWrapper template for serving a PAC file to point at alpaca or DIRECT. If we have a valid
 // PAC file, we wrap that PAC file with a wrapper function that only returns "DIRECT" or
-// "localhost:port". If we do not have a PAC file, the PAC function we serve only returns "DIRECT",
-// which should prevent all requests reaching us.
+// "127.0.0.1:port". If we do not have a PAC file, the PAC function we serve only returns
+// "DIRECT", which should prevent all requests reaching us.
+//
+// The literal address is deliberate: naming "localhost" here makes every client resolve it
+// before each proxied request. That is usually free, but not always. On Windows, a service
+// resolving "localhost" early during logon was measured taking the full 60 second WinHTTP
+// resolver timeout, and since nothing is listening on the proxy port at that stage either,
+// the first logon of the day cost over two minutes. Alpaca listens on both loopback families
+// by default, so clients reach it just as well through the literal address.
 var pacWrapTmpl = `// Wrapped for and by alpaca
 function FindProxyForURL(url, host) {
 {{ if .UpstreamPAC }}
-  return FindProxyForURL(url, host) === "DIRECT" ? "DIRECT" : "PROXY localhost:{{.Port}}";
+  return FindProxyForURL(url, host) === "DIRECT" ? "DIRECT" : "PROXY 127.0.0.1:{{.Port}}";
 {{.UpstreamPAC}}
 {{ else }}
   return "DIRECT";
